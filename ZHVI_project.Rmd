@@ -1,0 +1,555 @@
+---
+title: "ZHVI_project"
+author: "Ben Holden"
+date: "12/18/2022"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r load libraries}
+library(tidycensus)
+library(tidyverse)
+library(ggplot2)
+library(choroplethrZip)
+library(RColorBrewer)
+devtools::install_github("jjchern/zcta")
+
+```
+
+
+
+
+# PART 1:  Data Wrangling: ZCTA land area, population, demographics and income.
+
+
+#-----------------------------------------------Data frame no. 1:   ZCTA Land Area & 2010 Census Population-----------------------------------------------
+
+Loading ZCTA census package by "jjchern/zcta" GitHub repository:
+
+
+#Selecting all ZCTAs into dataframe matching ZCTAs to counties:
+zcta_area <- zcta::zcta_county_rel_10
+
+#Removing Duplicates, converting area from square meters to square miles, selecting relevant variables
+zcta_area <- zcta_area%>%
+  distinct(zcta5, .keep_all = TRUE)%>%
+  mutate(zcta_sq_mi = zarealand/2590000)%>%
+  select(zcta5, zpop, zcta_sq_mi)
+  
+
+
+#-----------------------------------------------Data frame no. 2:   2019 ACS population -----------------------------------------------------------
+
+#Loading 2019 American Community Survey (ACS) estimates of population by ZCTA-5
+zcta_population <-  read.csv("ACS2019_zcta1.csv")
+
+zcta_population <-  zcta_population%>%
+                         rename("acs2019_population" = B01003_001E,   #renaming variables for population and zcta
+                                "zcta5" = NAME)%>%                    
+                                  select(acs2019_population, zcta5)%>%         #selecting variables
+                                  relocate(zcta5, .before = acs2019_population)
+
+zcta_population <- zcta_population[-1,] #removing first observation containing description
+
+
+#Tidying unique identifier (ZCTA ID)
+zcta_population <- zcta_population%>%
+                      separate(zcta5, c("key", "zcta5"), " ")%>%
+                      select(zcta5, acs2019_population)%>%
+                      mutate(acs2019_population = as.numeric(acs2019_population, na.rm = TRUE))
+
+
+
+
+
+#-----------------------------------------------Data frame no. 3:   ZCTA Income, ACS 2019 --------------------------------------------------------
+
+
+#Income dataset
+zcta_income <- read.csv("ACS_2019_Income.csv", header = TRUE)
+
+
+zcta_income <- zcta_income%>%
+                rename("median_income" = B19013_001E,   #renaming variables for income and zcta
+                        "zcta5" = NAME)
+
+zcta_income <- zcta_income[-1,]
+
+
+#Tidying income dataset
+zcta_income <-  zcta_income%>%
+                  separate(zcta5, c("key", "zcta5"), " ")%>%    #splitting variable to only contain zcta code
+                  select(zcta5, median_income)%>%
+                  arrange(zcta5, .before = median_income)%>%
+                  mutate(median_income = as.numeric(median_income))
+
+
+
+#-----------------------------------------------Data frame no. 4:   ZCTA Demographics, 2019 ACS -----------------------------------------------
+
+#Race dataset, same procedure as other ACS datasets
+zcta_race <- read.csv("ACS_2019_race.csv", header = TRUE)
+
+zcta_race <- zcta_race[-1,]
+
+zcta_race <- zcta_race%>%
+  rename("population" = B02001_001E,
+         "white_total" = B02001_002E,
+         "black_total" = B02001_003E,
+         "zcta5" = NAME)%>%
+  select(zcta5,population,white_total,black_total)%>%
+  mutate(perc_white = (as.numeric(white_total)/as.numeric(population))*100,
+         perc_black = (as.numeric(black_total)/as.numeric(population))*100,
+         perc_other = 100-(perc_black + perc_white))%>%
+  separate(zcta5, c("key", "zcta5"), " ")%>%    #splitting variable to only contain zcta code)%>%
+  select(zcta5, perc_white, perc_black, perc_other)%>%
+  arrange(zcta5, .before = perc_white)
+
+
+
+#-----------------------------------------------Data frame no. 5:   All ZCTA characteristics -----------------------------------------------
+
+
+#joining population and area datasets into ZCTA main
+zctas <- inner_join(zcta_population,                              
+                    zcta_area,
+                    by = "zcta5")
+
+#adding income dataset
+zctas <- inner_join(zctas,
+                    zcta_income,
+                    by = "zcta5")
+
+zctas <- inner_join(zctas,
+                    zcta_race,
+                    by = "zcta5")
+
+
+#creating population density variables
+zctas <-  zctas%>%
+  mutate(zcta_density = (zpop/zcta_sq_mi),
+         zcta_density19 = (acs2019_population/zcta_sq_mi))%>%
+  rename("zpop19" = acs2019_population)
+  
+
+
+####
+
+
+
+
+
+  #Prepare df to join into main
+zctas_main <- zctas%>%
+            select( zcta5, median_income, zcta_density, perc_white, perc_black, perc_other, zpop)%>%
+            rename("RegionName" = zcta5)
+  
+  
+#//////////////////////////////////////////  PART 2:  DATA WRANGLING --- CREATING MAIN DATAFRAME  \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+#Loading dataset
+zips <- read_csv("zhvi_zip.csv")
+
+
+
+zips <- zips%>%
+  select(RegionName, City, CountyName, Metro, State, `2018-06-30`:`2021-09-30`)%>%    #Selecting only the relevant variables and months 
+  mutate(beforeprice = ((`2019-06-30`+ `2019-07-31`+`2019-08-31`+`2019-09-30`)/4),      #Calculating "before", "after", and "%change" variables
+         afterprice = ((`2021-06-30`+ `2021-07-31`+`2021-08-31`+`2021-09-30`)/4),
+         perc_chg = (as.numeric(afterprice/beforeprice)-1),                           #Percent change (0.00)
+         perc_chg_rounded = perc_chg*100)                                             # *100
+
+
+#joining dataframes
+zips_main <- inner_join(zips,
+                        zctas_main,
+                        by = "RegionName") 
+
+
+#shuffling around columns in dataframe
+zips_main <- zips_main%>%
+                relocate((`2018-06-30`:`2021-09-30`), .after = perc_other)%>%
+                relocate(beforeprice, .after = perc_other)%>%
+                relocate(afterprice, .after = beforeprice)%>%
+                relocate(perc_chg, .after = perc_other)%>%
+                relocate(perc_chg_rounded, .after = perc_chg)
+
+#Creating scaled income and density variables for regressions
+zips_main <- zips_main%>%
+                mutate(income_k = median_income/1000,
+                       density_k = zcta_density/1000)
+
+
+#creating separate dataframes for each Metropolitan Statistical Area
+
+#New York
+zips_newyork <- zips_main%>%
+                  filter(Metro %in% "New York-Newark-Jersey City")
+#DC
+zips_dc      <- zips_main%>%
+                  filter(Metro %in% "Washington-Arlington-Alexandria")
+#Boston
+zips_boston  <- zips_main%>%
+                  filter(Metro %in% "Boston-Cambridge-Newton")
+
+#San Francisco Bay Area
+sfbaymsas <- c("San Francisco-Oakland-Hayward", "San Jose-Sunnyvale-Santa Clara")
+sfbaymsas01 <-  c("San Francisco-Oakland-Hayward, CA","San Jose-Sunnyvale-Santa Clara, CA")
+
+
+zips_sfbay   <-  zips_main%>%
+                   filter(Metro %in% sfbaymsas)-> zip_sf
+
+#Denver and surrounding counties
+centralco <- c("Adams County", "Arapahoe County", "Broomfield County", "Clear Creek County", "Denver County", "Douglas County", "Elbert County",
+                     "Jefferson County", "Park County", "Gilpin County", "Boulder County", "Teller County", "El Paso County", "Summit County", "Grand County",
+                     "Larimer County", "Weld County", "Morgan County")
+
+
+zips_centralco <- zips_main%>%
+                    filter(CountyName %in% centralco,
+                           State == "CO")
+
+#//////////////////////////////////////////  PART 3:  CHOROPLETHS  \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+
+
+
+#Scatterplots by metro area
+ggplot(zips_newyork, aes(zcta_density_2010, perc_chg))+
+  geom_point()+
+  geom_smooth(method = lm, se = FALSE, color = "blue")+
+  ylab("Change in typical home values")+
+  xlab("2010 population / square mile")+
+  ggtitle("New York - Newark - Jersey City MSA")+
+  theme_bw()
+
+
+ggplot(zips_newyork, aes(median_income, perc_chg))+
+  geom_point()+
+  geom_smooth(method = lm, se = FALSE, color = "blue")+
+  ylab("Change in typical home values")+
+  xlab("2010 population / square mile")+
+  ggtitle("New York - Newark - Jersey City MSA")+
+  theme_bw()
+
+
+
+ggplot(zips_dc, aes(zcta_density_2010, perc_chg))+
+    geom_point()+
+    geom_smooth(method = lm, se = FALSE, color = "blue")+
+    ylab("Change in typical home values")+
+    xlab("2010 population / square mile")+
+    ggtitle("Washington-Arlington-Alexandria MSA")+
+    theme_bw()
+  
+
+
+
+ggplot(zips_boston, aes(zcta_density_2010, perc_chg))+
+  geom_point()+
+  geom_smooth(method = lm, se = FALSE, color = "blue")+
+  ylab("Change in typical home values")+
+  xlab("2010 population / square mile")+
+  ggtitle("Boston - Cambridge - Newton MSA")+
+  theme_bw()
+
+
+
+
+ggplot(zips_sfbay, aes(zcta_density_2010, perc_chg))+
+  geom_point()+
+  geom_smooth(method = lm, se = FALSE, color = "blue")+
+  ylab("Change in typical home values")+
+  xlab("2010 population / square mile")+
+  ggtitle("San Francisco & San Jose MSAs")+
+  theme_bw()
+
+
+ggplot(zips_centralco, aes(zcta_density_2010, perc_chg))+
+  geom_point()+
+  geom_smooth(method = lm, se = FALSE, color = "blue")+
+  ylab("Change in typical home values")+
+  xlab("2010 population / square mile")+
+  ggtitle("Denver MSA & Central Colorado")+
+  theme_bw()
+
+
+
+
+
+#custom color scale for ZHVI choros
+m20 <- "#8e0152"
+m15 <-  "#c51b7d"
+m10 <-  "#de77ae"
+m5 <- "#f1b6da"
+m0 <- "#fde0ef"
+p0 <- "#f7f7f7"
+p5 <- "#e6f5d0"
+p10 <- "#b8e186"
+p15 <-  "#7fbc41"
+p20 <- "#4d9221"
+p30 <-  "#276419"
+
+
+#NEW YORK
+zips_newyork%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName,
+         value = perc_chg)%>%
+  mutate(value, original_value = value) -> ny_ch
+
+
+
+ny_ch$value <- cut(ny_ch$value,
+                   breaks = c(-Inf, -0.20, -0.15, -0.1, -0.05, 0, 0.05, 0.10, 0.15, 0.20, 0.30, Inf),
+                   labels = c( "(20+)", "(15-20)", "(10-15)","(5-10)", "(0-5)", "0-5", "5-10", "10-15", "15-20", "20-30", "30+"),
+                   ordered_result = TRUE,
+                   include.lowest = FALSE)
+
+choro <-  ZipChoropleth$new(ny_ch)
+choro$title <- "% change in typical home value"
+choro$legend_title <- "%"
+choro$ggplot_scale <- scale_fill_manual(values = c(m20,m15,m10,m5,m0,p0,p5,p10,p15,p20,p30),
+                                        drop = FALSE,
+                                        na.value = "#d2d2d2")
+choro$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = "New York-Newark-Jersey City, NY-NJ-PA", zip_zoom = NULL)
+choro$render()
+
+
+
+
+#DC
+
+zips_dc%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName,
+         value = perc_chg)%>%
+  mutate(value, original_value = value) -> dc_ch
+
+
+dc_ch$value <- cut(dc_ch$value,
+                   breaks = c(-Inf, -0.20, -0.15, -0.1, -0.05, 0, 0.05, 0.10, 0.15, 0.20, 0.30, Inf),
+                   labels = c( "(20+)", "(15-20)", "(10-15)","(5-10)", "(0-5)", "0-5", "5-10", "10-15", "15-20", "20-30", "30+"),
+                   ordered_result = TRUE,
+                   include.lowest = FALSE)
+
+
+choro2 <-  ZipChoropleth$new(dc_ch)
+choro2$title <- "% change in typical home value"
+choro2$legend_title <- "%"
+choro2$ggplot_scale <- scale_fill_manual(values = c(m20,m15,m10,m5,m0,p0,p5,p10,p15,p20,p30),
+                                         drop = FALSE,
+                                         na.value = "#d2d2d2")
+choro2$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = "Washington-Arlington-Alexandria, DC-VA-MD-WV", zip_zoom = NULL)
+choro2$render()
+
+#SAN FRANCISCO
+
+
+zips_sfbay%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName,
+         value = perc_chg)%>%
+        mutate(value, original_value = value) -> sf_ch
+
+sf_ch$value <- cut(sf_ch$value,
+                   breaks = c(-Inf, -0.20, -0.15, -0.1, -0.05, 0, 0.05, 0.10, 0.15, 0.20, 0.30, Inf),
+                   labels = c( "(20+)", "(15-20)", "(10-15)","(5-10)", "(0-5)", "0-5", "5-10", "10-15", "15-20", "20-30", "30+"),
+                   ordered_result = TRUE,
+                   include.lowest = FALSE)
+
+choro3 <-  ZipChoropleth$new(sf_ch)
+choro3$title <- "Change in Home Value"
+choro3$ggplot_scale <- scale_fill_manual(values = c(m20,m15,m10,m5,m0,p0,p5,p10,p15,p20,p30),
+                                         drop = FALSE,
+                                         na.value = "#d2d2d2")
+
+choro3$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = sfbaymsas01, zip_zoom = NULL)
+choro3$render()
+
+
+
+#BOSTON
+
+
+zips_boston%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName,
+         value = perc_chg)%>%
+  mutate(value, original_value = value) -> bos_ch
+
+bos_ch$value <- cut(bos_ch$value,
+                    breaks = c(-Inf, -0.20, -0.15, -0.1, -0.05, 0, 0.05, 0.10, 0.15, 0.20, 0.30, Inf),
+                    labels = c( "(20+)", "(15-20)", "(10-15)","(5-10)", "(0-5)", "0-5", "5-10", "10-15", "15-20", "20-30", "30+"),
+                    ordered_result = TRUE,
+                    include.lowest = FALSE)
+#construct choropleth
+choro4 <-  ZipChoropleth$new(bos_ch)
+choro4$title <- "Change in Home Value"
+choro4$ggplot_scale <- scale_fill_manual(values = c(m20,m15,m10,m5,m0,p0,p5,p10,p15,p20,p30),
+                                         drop = FALSE,
+                                         na.value = "#d2d2d2")
+choro4$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = "Boston-Cambridge-Newton, MA-NH", zip_zoom = NULL)
+choro4$render()
+
+
+#CENTRAL COLORADO
+centralcofips <- c(8001, 8005, 8014, 8019, 8031, 8035,  8039, 8059, 8093, 8047, 8013, 8119, 8041, 8117, 8049, 8069, 8123, 8087)
+
+zips_centralco%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName,
+         value = perc_chg)%>%
+  mutate(value, original_value = value) -> co_ch
+
+co_ch$value <- cut(co_ch$value,
+                   breaks = c(-Inf, -0.20, -0.15, -0.1, -0.05, 0, 0.05, 0.10, 0.15, 0.20, 0.30, Inf),
+                   labels = c( "(20+)", "(15-20)", "(10-15)","(5-10)", "(0-5)", "0-5", "5-10", "10-15", "15-20", "20-30", "30+"),
+                   ordered_result = TRUE,
+                   include.lowest = FALSE)
+
+#choropleth
+choro5 <-  ZipChoropleth$new(co_ch)
+choro5$title <- "Change in Mean Home Value"
+choro5$ggplot_scale <- scale_fill_manual(values = c(m20,m15,m10,m5,m0,p0,p5,p10,p15,p20,p30),
+                                         drop = FALSE,
+                                         na.value = "#d2d2d2")
+choro5$set_zoom_zip(state_zoom = NULL, county_zoom = centralcofips, msa_zoom = NULL, zip_zoom = NULL)
+choro5$render()
+
+
+#choropleths for Population Density
+
+#NYC:
+zips_newyork%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName)%>%
+  mutate(zcta_density_2010, "value" = zcta_density_2010) -> ny_ch1
+
+
+
+choro6 <-  ZipChoropleth$new(ny_ch1)
+choro6$title <- "Population Density"
+choro6$legend_title <- "%"
+choro6$ggplot_scale <- scale_fill_brewer(palette = "GnBu")
+choro6$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = "New York-Newark-Jersey City, NY-NJ-PA", zip_zoom = NULL)
+choro6$render()
+
+
+#DC
+
+zips_dc%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName)%>%
+  mutate(zcta_density_2010, "value" = zcta_density_2010) -> dc_ch1
+
+
+choro7 <-  ZipChoropleth$new(dc_ch1)
+choro7$title <- "Population Density"
+choro7$ggplot_scale <- scale_fill_brewer(palette = "GnBu")
+choro7$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = "Washington-Arlington-Alexandria, DC-VA-MD-WV", zip_zoom = NULL)
+choro7$render()
+
+
+#SF
+
+zips_sfbay%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName)%>%
+  mutate(zcta_density_2010, "value" = zcta_density_2010) -> sf_ch1
+
+
+#choropleth
+choro8 <-  ZipChoropleth$new(sf_ch1)
+choro8$title <- "Population Density"
+choro8$ggplot_scale <- scale_fill_brewer(palette = "GnBu")
+choro8$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = sfbaymsas01, zip_zoom = NULL)
+choro8$render()
+
+
+#Boston
+
+zips_boston%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName)%>%
+  mutate(zcta_density_2010, "value" = zcta_density_2010) -> bos_ch1
+
+#construct choropleth
+choro9 <-  ZipChoropleth$new(bos_ch1)
+choro9$title <- "Population Density"
+choro9$ggplot_scale <- scale_fill_brewer(palette = "GnBu")
+choro9$set_zoom_zip(state_zoom = NULL, county_zoom = NULL, msa_zoom = "Boston-Cambridge-Newton, MA-NH", zip_zoom = NULL)
+choro9$render()
+
+
+#Colorado
+
+zips_centralco%>%
+  select(RegionName, City, CountyName, Metro, State, perc_chg, zcta_density_2010, zcta_density_2019)%>%
+  rename(region = RegionName)%>%
+  mutate(zcta_density_2010, "value" = zcta_density_2010) -> co_ch1
+
+
+#choropleth
+choro10 <-  ZipChoropleth$new(co_ch1)
+choro10$title <- "Population Density"
+choro10$ggplot_scale <- scale_fill_brewer(palette = "GnBu")
+choro10$set_zoom_zip(state_zoom = NULL, county_zoom = centralcofips, msa_zoom = NULL, zip_zoom = NULL)
+choro10$render()
+
+
+
+
+#//////////////////////////////////////////  PART 4:  DATA ANALYSIS & REGRESSIONS  \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+
+ggplot(zips_newyork, aes(perc_white, perc_black))+
+  geom_point()+
+  geom_smooth(method = lm, se = FALSE)
+
+cor(x= zips_newyork$median_income, y= zips_newyork$perc_white, use= "complete.obs")
+cor(x= zips_dc$median_income, y= zips_dc$perc_white, use= "complete.obs")
+cor(x= zips_boston$median_income, y= zips_boston$perc_white, use= "complete.obs")
+cor(x= zips_sfbay$median_income, y= zips_sfbay$perc_white, use= "complete.obs")
+cor(x= zips_centralco$median_income, y= zips_centralco$perc_white, use= "complete.obs")
+
+
+nyfit <- lm(perc_chg_rounded ~ density_k + income_k + perc_white + density_k:perc_white, data = zips_newyork)
+summary(nyfit)
+
+
+bosfit <- lm(perc_chg_rounded ~ density_k + income_k + perc_white + income_k:perc_white, data = zips_boston)
+summary(bosfit)
+
+sffit <- lm(perc_chg_rounded ~ density_k + income_k + density_k:income_k, data = zips_sfbay)
+summary(sffit)
+
+
+dcfit <- lm(perc_chg_rounded ~ density_k + income_k , data = zips_dc)
+summary(dcfit)
+
+
+cofit <- lm(perc_chg_rounded ~ density_k + income_k + perc_white + income_k:perc_white, data = zips_centralco)
+summary(cofit)
+
+
+#Weighted Means
+
+#Change
+weighted.mean(zips_newyork$perc_chg_rounded, zips_newyork$zpop, na.rm = TRUE)
+weighted.mean(zips_boston$perc_chg_rounded, zips_boston$zpop, na.rm = TRUE)
+weighted.mean(zips_sfbay$perc_chg_rounded, zips_sfbay$zpop, na.rm = TRUE)
+weighted.mean(zips_dc$perc_chg_rounded, zips_dc$zpop, na.rm = TRUE)
+weighted.mean(zips_centralco$perc_chg_rounded, zips_centralco$zpop, na.rm = TRUE)
+
+#White Population
+weighted.mean(zips_newyork$perc_white, zips_newyork$zpop, na.rm = TRUE)
+weighted.mean(zips_boston$perc_white, zips_boston$zpop, na.rm = TRUE)
+weighted.mean(zips_sfbay$perc_white, zips_sfbay$zpop, na.rm = TRUE)
+weighted.mean(zips_dc$perc_white, zips_dc$zpop, na.rm = TRUE)
+weighted.mean(zips_centralco$perc_white, zips_centralco$zpop, na.rm = TRUE)
+
+
+
